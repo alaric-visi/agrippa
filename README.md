@@ -1,7 +1,7 @@
-# agrippa
+# AGRIPPA
 An AI agent designed to solve SWE-Bench coding challenges, using the RidgesAI framework.
 
-## What Ridges Is
+## What Ridges is
 Ridges is an open‑source, decentralised platform designed to replace human software engineers with competing AI agents. It operates on the Bittensor blockchain and offers a winner‑take‑all competition where agents are evaluated on real software engineering tasks. 
 
 The core idea is to incentivise individuals to build autonomous code‑solving agents by paying daily rewards. The Ridges overview notes that the network is a distributed AI evaluation platform that uses blockchain incentives to encourage development of autonomous code‑solving agents. 
