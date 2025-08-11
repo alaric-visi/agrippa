@@ -90,3 +90,24 @@ The key orchestration happens in execute_workflow. After resetting the git state
 3. Deduplicates identical tool calls to avoid wasted steps.
 4. Executes the chosen tool using execute_tool. If a modifying tool is used (edit, insert or create file), ```_maybe_auto_syntax_check``` automatically runs ```run_syntax_check``` on the modified file to catch syntax errors early. This mirrors the Ridges requirement that agents maintain valid syntax and avoid invalid patches.
 5. Appends the observation (tool output) to the trajectory and repeats.
+
+The loop stops if the ```finish``` tool is called, if a timeout occurs (```AGENT_TIMEOUT``` minus the time spent), or if too many consecutive errors are observed. Once the loop ends, execute_workflow collects a git diff of all changes (```get_final_git_patch```) and returns it along with logs.
+
+### Entry point
+The ```agent_main``` function is the required entry point for Ridges agents. It extracts the ```problem_statement```, ```run_id``` and ```instance_id``` from the input dictionary. It ensures that the working directory points to the repo (where the target project lives). 
+
+It resets the git state to a clean slate, executes the workflow with the specified timeout, and returns a dictionary containing the final patch. Returning a patch in this format satisfies Ridges’ requirement that agents return a git diff through the patch key. 
+
+After producing the patch, it resets the git state again so that the harness can apply the patch separately.
+
+## How the agent fits into the Ridges framework
+The agent implements the behaviours expected by the Ridges platform:
+
+1. **Single‑file agent with agent_main** – The file defines an agent_main function at the top level that accepts an ```input_dict``` and returns a patch. This matches the agent structure requirements documented in the Miner Guide. Because the entire agent logic is contained in one file, it can be easily uploaded via the platform’s /upload endpoint.
+2. **Use of Ridges’ proxy for inference** – External model calls go through ```_request_with_retry```, which sends ```POST``` requests to ```DEFAULT_PROXY_URL``` (derived from ```AI_PROXY_URL```). The proxy validates each request by run ID and enforces cost limits, as described in the Proxy documentation. This ensures the agent respects per‑run cost caps and cannot bypass cost control.
+3. **Respect for sandbox restrictions** – The agent interacts with the repository exclusively through pre‑approved tools (read, search, edit, etc.) and refuses to modify test files. This aligns with the platform’s security rules (sandboxed execution, code validation and import restrictions). The agent never executes arbitrary shell commands except through controlled functions like run_subprocess inside certain tools, and even then only for search or listing files.
+4. **Automatic syntax checking** – After each file modification, the agent runs run_syntax_check. Ridges validators judge patches based on whether they compile and pass tests; by checking syntax early, the agent reduces the risk of submitting invalid patches. Validators run each agent’s code in isolated Docker containers and test patches on SWE‑bench problems, so syntax errors would cause failures.
+5. **Trajectory management and timeouts** – The workflow enforces a maximum number of steps and stops early if insufficient time remains. The miner guide notes that agents have limited time and cost budgets in the sandbox. By truncating trajectories, deduplicating calls and respecting timeouts, the agent uses its allowed resources efficiently.
+6. **Returning a patch** – Finally, ```agent_main returns``` a dictionary with a patch key containing a git diff of the changes. Validators will apply this patch to the repository and run tests. This output format matches the Ridges specification.
+
+Overall, this Python file implements a self‑contained software‑engineering agent designed to operate within the Ridges AI ecosystem. It leverages the proxy for inference, uses sandbox‑approved tools to inspect and modify code, enforces syntax correctness, and produces a patch that can be evaluated by validators. Its design directly mirrors Ridges’ architecture and evaluation process, ensuring compatibility with the competition’s rules and allowing it to participate in the Ridges marketplace of autonomous agents.
