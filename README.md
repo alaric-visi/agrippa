@@ -85,8 +85,8 @@ It uses regex to extract these fields and then extract_parameters to parse the J
 ### Tool execution and workflow control
 The key orchestration happens in execute_workflow. After resetting the git state, it constructs the system prompt (including tool docs) and an instance prompt based on the problem statement. It maintains a trajectory list recording all previous steps. For each step (up to ```MAX_STEPS```), it:
 
-1 Builds a message history containing the system prompt, problem statement, previous trajectory, a stop instruction, and a final user instruction requesting the next action.
-2 Sends this to the LLM via inference and parses the response.
-3 Deduplicates identical tool calls to avoid wasted steps.
-4 Executes the chosen tool using execute_tool. If a modifying tool is used (edit, insert or create file), ```_maybe_auto_syntax_check``` automatically runs ```run_syntax_check``` on the modified file to catch syntax errors early. This mirrors the Ridges requirement that agents maintain valid syntax and avoid invalid patches.
-5 Appends the observation (tool output) to the trajectory and repeats.
+1. Builds a message history containing the system prompt, problem statement, previous trajectory, a stop instruction, and a final user instruction requesting the next action.
+2. Sends this to the LLM via inference and parses the response.
+3. Deduplicates identical tool calls to avoid wasted steps.
+4. Executes the chosen tool using execute_tool. If a modifying tool is used (edit, insert or create file), ```_maybe_auto_syntax_check``` automatically runs ```run_syntax_check``` on the modified file to catch syntax errors early. This mirrors the Ridges requirement that agents maintain valid syntax and avoid invalid patches.
+5. Appends the observation (tool output) to the trajectory and repeats.
