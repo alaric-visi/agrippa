@@ -28,17 +28,17 @@ Validators then run each surviving agent on ~50 SWE‑bench problems, checking t
 Agents run in isolated containers and cannot make arbitrary external calls. Instead, each agent receives environment variables specifying a proxy URL and a timeout; external requests must go through the proxy and are limited by a cost cap.
 
 ### Requirements for Agents
-Ridges imposes strict requirements on submitted agents. The Miner Guide explains that an agent must be a single Python file containing a top‑level function called agent_main. This function receives an input_dict containing at least a problem_statement and returns a dictionary with a patch key holding a git diff. 
+Ridges imposes strict requirements on submitted agents. The Miner Guide explains that an agent must be a single Python file containing a top‑level function called ```agent_main```. This function receives an input_dict containing at least a problem_statement and returns a dictionary with a patch key holding a git diff. 
 
 The agent can only use Python’s standard library and a limited set of approved external libraries. 
 
-Agents are sandboxed under the /repo path and cannot access external systems directly; all external inference or embedding requests must go through the proxy using the AI_PROXY_URL environment variable. The sandbox enforces timeouts (currently two minutes) and cost caps on inference and embeddings.
+Agents are sandboxed under the /repo path and cannot access external systems directly; all external inference or embedding requests must go through the proxy using the ```AI_PROXY_URL``` environment variable. The sandbox enforces timeouts (currently two minutes) and cost caps on inference and embeddings.
 
 ## My agent
 The Python implements an autonomous software‑engineering agent conforming to the Ridges requirements. It acts as the “brain” that reads a problem statement, explores the repository, generates code edits, and returns a patch. The code is structured into several sections.
 
 ### Configuration and prompts
-The file defines constants for environment variables such as AI_PROXY_URL, AGENT_TIMEOUT, and the model identifier used for inference (AGENT_MODELS). It sets tunable limits such as MAX_STEPS (maximum actions per problem), MAX_RETRIES, and MAX_CONSECUTIVE_ERRORS. 
+The file defines constants for environment variables such as ```AI_PROXY_URL```, ```AGENT_TIMEOUT```, and the model identifier used for inference (AGENT_MODELS). It sets tunable limits such as ```MAX_STEPS``` (maximum actions per problem), ```MAX_RETRIES```, and ```MAX_CONSECUTIVE_ERRORS```. 
 
 A PROMPTS dictionary contains formatted strings used to instruct the large language model (LLM). 
 
@@ -69,7 +69,7 @@ To help the LLM choose which tool to call, the agent dynamically generates JSON 
 ```get_tool_docs``` builds a string describing each tool’s signature and docstring. These are inserted into the system prompt so the LLM knows how to call the tools.
 
 ### Inference helpers
-Agents in Ridges are not allowed to use arbitrary external services. Instead, they must call the proxy for inference. The functions ```_make_request```, ```_parse_response``` and ```_request_with_retry``` implement this logic. ```_make_request``` makes an HTTP POST to the proxy using the configured ```REQUEST_TIMEOUT```. ```_parse_response``` handles the different response formats from the proxy and returns the generated text. ```_request_with_retry``` attempts inference up to MAX_RETRIES, first calling the legacy /agents/inference endpoint on the proxy and optionally falling back to a chat endpoint when enabled. It uses exponential backoff to respect rate limits.
+Agents in Ridges are not allowed to use arbitrary external services. Instead, they must call the proxy for inference. The functions ```_make_request```, ```_parse_response``` and ```_request_with_retry``` implement this logic. ```_make_request``` makes an ```HTTP POST``` to the proxy using the configured ```REQUEST_TIMEOUT```. ```_parse_response``` handles the different response formats from the proxy and returns the generated text. ```_request_with_retry``` attempts inference up to ```MAX_RETRIES```, first calling the legacy /agents/inference endpoint on the proxy and optionally falling back to a chat endpoint when enabled. It uses exponential backoff to respect rate limits.
 
 The top‑level inference function wraps this logic: it builds a request with the cleaned message history, sets the desired model and temperature, and sends it through the proxy. Because the ```run_id``` is included in the request, the proxy can verify that the call is authorised and track cost; this matches the Ridges proxy’s requirement that each request includes a valid run ID and that cost is tracked per evaluation run.
 
@@ -80,7 +80,7 @@ next_thought: …
 next_tool_name: …
 next_tool_args: …
 ```
-It uses regex to extract these fields and then extract_parameters to parse the JSON‑like argument string, supporting JSON, Python literal syntax and fallback regex extraction. If the model omits required fields or provides invalid JSON, the agent reports an error.
+It uses regex to extract these fields and then ```extract_parameters``` to parse the JSON‑like argument string, supporting JSON, Python literal syntax and fallback regex extraction. If the model omits required fields or provides invalid JSON, the agent reports an error.
 
 ### Tool execution and workflow control
 The key orchestration happens in execute_workflow. After resetting the git state, it constructs the system prompt (including tool docs) and an instance prompt based on the problem statement. It maintains a trajectory list recording all previous steps. For each step (up to ```MAX_STEPS```), it:
