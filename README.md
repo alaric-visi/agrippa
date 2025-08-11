@@ -59,7 +59,7 @@ To allow the agent to inspect and modify the repository, the file provides a set
 - ```discover_relevant_files``` looks for files in the same directory or files that import or are imported by a given module.
 - ```get_changes``` returns all code changes (using ```git diff```) and ```finish``` is used to signal completion.
 
-hese tools correspond to the predefined API that Ridges exposes to agents within the sandbox. Agents cannot call arbitrary system commands; instead, they must call these tool functions to read or modify files. 
+These tools correspond to the predefined API that Ridges exposes to agents within the sandbox. Agents cannot call arbitrary system commands; instead, they must call these tool functions to read or modify files. 
 
 Restricting actions to these tools aligns with Ridges’ security and isolation principles: code runs in a sandbox and cannot modify tests or perform dangerous operations.
 
@@ -68,4 +68,25 @@ To help the LLM choose which tool to call, the agent dynamically generates JSON 
 
 ```get_tool_docs``` builds a string describing each tool’s signature and docstring. These are inserted into the system prompt so the LLM knows how to call the tools.
 
+### Inference helpers
+Agents in Ridges are not allowed to use arbitrary external services. Instead, they must call the proxy for inference. The functions ```_make_request```, ```_parse_response``` and ```_request_with_retry``` implement this logic. ```_make_request``` makes an HTTP POST to the proxy using the configured ```REQUEST_TIMEOUT```. ```_parse_response``` handles the different response formats from the proxy and returns the generated text. ```_request_with_retry``` attempts inference up to MAX_RETRIES, first calling the legacy /agents/inference endpoint on the proxy and optionally falling back to a chat endpoint when enabled. It uses exponential backoff to respect rate limits.
 
+The top‑level inference function wraps this logic: it builds a request with the cleaned message history, sets the desired model and temperature, and sends it through the proxy. Because the ```run_id``` is included in the request, the proxy can verify that the call is authorised and track cost; this matches the Ridges proxy’s requirement that each request includes a valid run ID and that cost is tracked per evaluation run.
+
+### Action parsing
+Once the LLM produces a response, the agent must parse it to extract the next action. The helper extract_action_format expects the LLM output to contain:
+```
+next_thought: …
+next_tool_name: …
+next_tool_args: …
+```
+It uses regex to extract these fields and then extract_parameters to parse the JSON‑like argument string, supporting JSON, Python literal syntax and fallback regex extraction. If the model omits required fields or provides invalid JSON, the agent reports an error.
+
+### Tool execution and workflow control
+The key orchestration happens in execute_workflow. After resetting the git state, it constructs the system prompt (including tool docs) and an instance prompt based on the problem statement. It maintains a trajectory list recording all previous steps. For each step (up to ```MAX_STEPS```), it:
+
+1 Builds a message history containing the system prompt, problem statement, previous trajectory, a stop instruction, and a final user instruction requesting the next action.
+2 Sends this to the LLM via inference and parses the response.
+3 Deduplicates identical tool calls to avoid wasted steps.
+4 Executes the chosen tool using execute_tool. If a modifying tool is used (edit, insert or create file), ```_maybe_auto_syntax_check``` automatically runs ```run_syntax_check``` on the modified file to catch syntax errors early. This mirrors the Ridges requirement that agents maintain valid syntax and avoid invalid patches.
+5 Appends the observation (tool output) to the trajectory and repeats.
