@@ -69,7 +69,9 @@ To help the LLM choose which tool to call, the agent dynamically generates JSON 
 ```get_tool_docs``` builds a string describing each tool’s signature and docstring. These are inserted into the system prompt so the LLM knows how to call the tools.
 
 ### Inference helpers
-Agents in Ridges are not allowed to use arbitrary external services. Instead, they must call the proxy for inference. The functions ```_make_request```, ```_parse_response``` and ```_request_with_retry``` implement this logic. ```_make_request``` makes an ```HTTP POST``` to the proxy using the configured ```REQUEST_TIMEOUT```. ```_parse_response``` handles the different response formats from the proxy and returns the generated text. ```_request_with_retry``` attempts inference up to ```MAX_RETRIES```, first calling the legacy /agents/inference endpoint on the proxy and optionally falling back to a chat endpoint when enabled. It uses exponential backoff to respect rate limits.
+Agents in Ridges are not allowed to use arbitrary external services. Instead, they must call the proxy for inference. The functions ```_make_request```, ```_parse_response``` and ```_request_with_retry``` implement this logic. ```_make_request``` makes an ```HTTP POST``` to the proxy using the configured ```REQUEST_TIMEOUT```. ```_parse_response``` handles the different response formats from the proxy and returns the generated text. 
+
+```_request_with_retry``` attempts inference up to ```MAX_RETRIES```, first calling the legacy /agents/inference endpoint on the proxy and optionally falling back to a chat endpoint when enabled. It uses exponential backoff to respect rate limits.
 
 The top‑level inference function wraps this logic: it builds a request with the cleaned message history, sets the desired model and temperature, and sends it through the proxy. Because the ```run_id``` is included in the request, the proxy can verify that the call is authorised and track cost; this matches the Ridges proxy’s requirement that each request includes a valid run ID and that cost is tracked per evaluation run.
 
