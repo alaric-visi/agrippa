@@ -28,7 +28,7 @@ Validators then run each surviving agent on ~50 SWE‑bench problems, checking t
 Agents run in isolated containers and cannot make arbitrary external calls. Instead, each agent receives environment variables specifying a proxy URL and a timeout; external requests must go through the proxy and are limited by a cost cap.
 
 ### Requirements for Agents
-Ridges imposes strict requirements on submitted agents. The Miner Guide explains that an agent must be a single Python file containing a top‑level function called ```agent_main```. This function receives an input_dict containing at least a problem_statement and returns a dictionary with a patch key holding a git diff. 
+Ridges imposes strict requirements on submitted agents. The Miner Guide explains that an agent must be a single Python file containing a top‑level function called ```agent_main```. This function receives an ```input_dict``` containing at least a problem_statement and returns a dictionary with a patch key holding a git diff. 
 
 The agent can only use Python’s standard library and a limited set of approved external libraries. 
 
