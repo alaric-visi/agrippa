@@ -76,7 +76,7 @@ Agents in Ridges are not allowed to use arbitrary external services. Instead, th
 The top‑level inference function wraps this logic: it builds a request with the cleaned message history, sets the desired model and temperature, and sends it through the proxy. Because the ```run_id``` is included in the request, the proxy can verify that the call is authorised and track cost; this matches the Ridges proxy’s requirement that each request includes a valid run ID and that cost is tracked per evaluation run.
 
 ### Action parsing
-Once the LLM produces a response, the agent must parse it to extract the next action. The helper extract_action_format expects the LLM output to contain:
+Once the LLM produces a response, the agent must parse it to extract the next action. The helper ```extract_action_format``` expects the LLM output to contain:
 ```
 next_thought: …
 next_tool_name: …
