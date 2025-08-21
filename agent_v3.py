@@ -3598,30 +3598,66 @@ import json
 import traceback
 import time
 
-# Reuse from earlier sections:
+# Reuse from earlier sections (expected to exist):
 # - LOGGER (Section 2)
-# - run_cmd (Section 3)
+# - run_cmd (Section 1/2)
 # - run_pytest (Section 6)
 # - git_add_all, git_diff_staged, git_checkout_new_branch_if_needed (Section 3)
 # - heuristic_test_filter_from_problem (Section 16 back-compat shim)
 # - route_and_apply_recipes (Section 13)
 # - _ensure_git_safe_directory (Section 3)
 # - _safe_json (Section 1)
-# - _read_text_safe, _write_text_safe (Section 13)
 
+# --- Local tiny helpers so Section 15 is self-contained if needed ---
+def _read_text_safe(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+def _write_text_safe(path: str, content: str) -> bool:
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return True
+    except Exception:
+        return False
+
+DEBUG_LOG = "/tmp/ridges_agent_debug.log"
+
+def _dbg(msg: str) -> None:
+    """Append to a persistent debug log and echo to LOGGER."""
+    try:
+        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(msg.rstrip() + "\n")
+    except Exception:
+        pass
+    try:
+        LOGGER.info(msg)  # type: ignore[name-defined]
+    except Exception:
+        print(msg, file=sys.stderr)
 
 def run_llm_loop(
     problem_statement: str,
-    initial_failures: List[str],
+    initial_failures: list,
     repo_dir: str,
-    logs: List[str],
+    logs: list,
     timeout: Optional[int] = None,
 ) -> bool:
     """
-    Plan–act loop: lets the LLM read the repo, propose edits, run quick tests,
-    syntax-check, and iterate. Always returns True to indicate the loop ran.
-    The caller will collect the final patch via git_diff_staged afterwards.
+    Plan–act loop: lets the LLM read the repo, propose edits, syntax-check,
+    and iterate. Always returns True to indicate the loop ran. The caller
+    will collect the patch via git_diff_staged afterwards.
     """
+    # mark that loop started (observable on host)
+    try:
+        open("/tmp/ridges_llm_loop_started", "w").write("1")
+    except Exception:
+        pass
+    _dbg("LLM_LOOP: start")
+
     # --- Tool docs shown to the model (keep concise & actionable) ---
     tool_docs = [
         "list_files(directory: string='.') -> newline-separated .py files",
@@ -3630,7 +3666,6 @@ def run_llm_loop(
         "edit_file_regex(file_path: string, pattern: string, replacement: string, count: int=1, flags: string='') -> status",
         "edit_file(file_path: string, old_code: string, new_code: string) -> status",
         "insert_code_at_location(file_path: string, line_number: int, code: string, position: string='after') -> status",
-        "run_repo_tests(k_expr: string=None, max_seconds: int=120) -> pytest summary and failing trace",
         "run_syntax_check(file_path: string) -> status",
         "get_changes() -> current staged diff",
         "finish() -> signal done",
@@ -3645,10 +3680,6 @@ def run_llm_loop(
         "next_thought: <what you will do next>\n"
         "next_tool_name: <tool name>\n"
         "next_tool_args: {json-args}\n"
-        "\n"
-        "Tip: Start by calling run_repo_tests (with a narrow k_expr if possible) to see the failing assertion. "
-        "After each edit, rerun run_repo_tests to verify progress. "
-        "If tests still fail after an edit, do not repeat the same change; inspect the traceback and adjust the logic."
     )
 
     instance_prompt = (
@@ -3658,18 +3689,19 @@ def run_llm_loop(
     )
 
     # --- LLM calling helper (uses your proxy defaults) ---
-    import requests  # local import to keep Section 15 self-contained
+    import requests
     AI_PROXY_URL = os.getenv("AI_PROXY_URL", "http://sandbox-proxy").rstrip("/")
     MODEL = os.getenv("AGENT_MODEL", os.getenv("AGENT_MODELS", "zai-org/GLM-4.5-FP8")).split(",")[0].strip()
+    REQUEST_TIMEOUT = int(os.getenv("AGENT_REQUEST_TIMEOUT", "60"))
 
-    def _call_llm(messages):
+    def _call_llm(messages: List[Dict[str, str]]) -> str:
         url_candidates = [f"{AI_PROXY_URL}/agents/inference", f"{AI_PROXY_URL}/chat/completions"]
         last_err = None
         for url in url_candidates:
             try:
                 payload = {"model": MODEL, "messages": messages, "temperature": 0.0, "max_tokens": 2048}
-                LOGGER.info("LLM CALL -> %s (%d messages)", url, len(messages))
-                r = requests.post(url, json=payload, timeout=60)
+                _dbg(f"LLM CALL -> {url} (messages={len(messages)})")
+                r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
                 r.raise_for_status()
                 # Try OpenAI-style JSON first
                 try:
@@ -3677,61 +3709,51 @@ def run_llm_loop(
                     if isinstance(data, dict) and "choices" in data and data["choices"]:
                         choice = data["choices"][0]
                         content = choice.get("message", {}).get("content") or choice.get("text") or ""
-                        LOGGER.info("LLM RESP (first 200): %s", (content or "")[:200])
+                        _dbg(f"LLM RESP <- {url} | {str(content)[:200]!r}")
                         return (content or "").strip()
                 except Exception:
                     pass
-                LOGGER.info("LLM RESP (first 200, raw): %s", (r.text or "")[:200])
+                _dbg(f"LLM RESP <- {url} (raw) | {r.text[:200]!r}")
                 return (r.text or "").strip()
             except Exception as e:
                 last_err = e
-                LOGGER.warning("LLM call failed for %s: %s", url, e)
+                _dbg(f"LLM call failed for {url}: {e}")
         raise RuntimeError(f"LLM calls failed: {last_err}")
 
     # --- Tool executor (minimal, self-contained) ---
-    def _exec_tool(name, args):
+    MODIFYING_TOOLS = {"edit_file", "edit_file_regex", "insert_code_at_location", "create_file"}
+
+    def _exec_tool(name: str, args: dict) -> str:
+        _dbg(f"EXEC_TOOL: {name} args={args}")
         try:
             if name == "list_files":
-                out, _ = run_cmd(["bash", "-lc", "find . -name '*.py' -type f | sed 's|^./||'"])
+                out, _ = run_cmd(["bash", "-lc", "find . -name '*.py' -type f | sed 's|^./||'"])  # type: ignore[name-defined]
                 return out
             elif name == "read_file":
                 path = args.get("file_path")
-                if not path:
-                    return "file_path required"
+                if not path: return "file_path required"
                 start = int(args.get("start_line") or 0)
                 end = int(args.get("end_line") or 0)
                 txt = _read_text_safe(path)
                 if start or end:
                     lines = txt.splitlines(True)
-                    a = max(0, start - 1) if start else 0
+                    a = max(0, start-1) if start else 0
                     b = min(len(lines), end) if end else len(lines)
                     return "".join(lines[a:b])
                 return txt
             elif name == "search_codebase":
                 term = args.get("search_term") or ""
-                # Quote safely for grep
-                out, _ = run_cmd([
-                    "bash", "-lc",
-                    f"grep -rn -B 3 -A 3 --include='*.py' . -e {json.dumps(term)} || true"
-                ])
+                out, _ = run_cmd(["bash", "-lc", f"grep -rn -B 3 -A 3 --include='*.py' . -e \"{term}\" || true"])  # type: ignore[name-defined]
                 return out
             elif name == "edit_file_regex":
                 import re as _re
-                path = args.get("file_path")
-                pattern = args.get("pattern", "")
-                repl = args.get("replacement", "")
-                count = int(args.get("count", 1))
-                flags = args.get("flags", "")
-                if not path:
-                    return "file_path required"
-                txt = _read_text_safe(path)
+                path = args.get("file_path"); pattern = args.get("pattern",""); repl = args.get("replacement","")
+                count = int(args.get("count", 1)); flags = args.get("flags","")
                 re_flags = 0
-                if "I" in flags:
-                    re_flags |= _re.IGNORECASE
-                if "M" in flags:
-                    re_flags |= _re.MULTILINE
-                if "S" in flags:
-                    re_flags |= _re.DOTALL
+                if "I" in flags: re_flags |= _re.IGNORECASE
+                if "M" in flags: re_flags |= _re.MULTILINE
+                if "S" in flags: re_flags |= _re.DOTALL
+                txt = _read_text_safe(path)
                 new_txt, n = _re.subn(pattern, repl, txt, count=0 if count == -1 else count, flags=re_flags)
                 if n > 0 and new_txt != txt:
                     _write_text_safe(path, new_txt)
@@ -3746,14 +3768,9 @@ def run_llm_loop(
                     return obs
                 return "No matches"
             elif name == "edit_file":
-                path = args.get("file_path")
-                old = args.get("old_code", "")
-                new = args.get("new_code", "")
-                if not path:
-                    return "file_path required"
+                path = args.get("file_path"); old = args.get("old_code",""); new = args.get("new_code","")
                 txt = _read_text_safe(path)
-                if old not in txt:
-                    return "old_code not found"
+                if old not in txt: return "old_code not found"
                 new_txt = txt.replace(old, new, 1)
                 _write_text_safe(path, new_txt)
                 if path.endswith(".py"):
@@ -3764,15 +3781,11 @@ def run_llm_loop(
                         return f"edited + syntax error: {e}"
                 return "edited"
             elif name == "insert_code_at_location":
-                path = args.get("file_path")
-                line = int(args.get("line_number", 1))
-                code = args.get("code", "")
-                pos = args.get("position", "after")
-                if not path:
-                    return "file_path required"
+                path = args.get("file_path"); line = int(args.get("line_number", 1))
+                code = args.get("code",""); pos = args.get("position","after")
                 lines = _read_text_safe(path).splitlines(True)
-                idx = max(0, min(len(lines), line - 1 if pos == "before" else line))
-                lines.insert(idx, code if code.endswith("\n") else code + "\n")
+                idx = max(0, min(len(lines), line-1 if pos=="before" else line))
+                lines.insert(idx, code if code.endswith("\n") else code+"\n")
                 new_txt = "".join(lines)
                 _write_text_safe(path, new_txt)
                 if path.endswith(".py"):
@@ -3782,34 +3795,22 @@ def run_llm_loop(
                     except Exception as e:
                         return f"inserted + syntax error: {e}"
                 return "inserted"
-            elif name == "run_repo_tests":
-                k_expr = args.get("k_expr")
-                max_seconds = int(args.get("max_seconds", 120))
-                try:
-                    triage = run_pytest(repo_dir, k_expr=k_expr, path=None, max_seconds=max_seconds)
-                    summary = {
-                        "collected": triage.get("collected"),
-                        "failed": triage.get("failed"),
-                        "returncode": triage.get("returncode"),
-                        "nodeids": triage.get("nodeids") or triage.get("failed_tests") or triage.get("failures"),
-                        "output_tail": (triage.get("output_tail") or triage.get("stderr_tail") or triage.get("stdout_tail") or "")[-4000:],
-                    }
-                    return json.dumps(summary, ensure_ascii=False)
-                except Exception as e:
-                    return f"run_repo_tests error: {e}"
             elif name == "run_syntax_check":
                 path = args.get("file_path")
-                if not path:
-                    return "file_path required"
                 src = _read_text_safe(path)
                 try:
-                    compile(src, path, "exec")
-                    return "syntax OK"
+                    compile(src, path, "exec"); return "syntax OK"
                 except Exception as e:
                     return f"syntax error: {e}"
             elif name == "get_changes":
-                git_add_all(repo_dir)
-                return git_diff_staged(repo_dir)
+                try:
+                    git_add_all(repo_dir)  # type: ignore[name-defined]
+                except Exception as e:
+                    _dbg(f"git_add_all failed (non-fatal): {e}")
+                try:
+                    return git_diff_staged(repo_dir)  # type: ignore[name-defined]
+                except Exception as e:
+                    return f"git diff failed: {e}"
             elif name == "finish":
                 return "TASK_COMPLETE"
             else:
@@ -3819,23 +3820,15 @@ def run_llm_loop(
 
     # --- main loop ---
     trajectory: List[str] = []
-    max_steps = int(os.getenv("AGENT_MAX_STEPS", "40"))
-    start_time = time.time()
-    req_timeout = int(os.getenv("AGENT_REQUEST_TIMEOUT", "60"))
-    for step in range(max_steps):
-        # soft time budget so we don't collide with the overall harness timeout
-        elapsed = time.time() - start_time
-        overall_timeout = timeout or int(os.getenv("AGENT_TIMEOUT", "1200"))
-        if overall_timeout - elapsed < (req_timeout + 10):
-            logs.append(f"LLM loop stopping early for time safety (step={step+1})")
-            break
+    max_steps = int(os.getenv("AGENT_MAX_STEPS", "60"))
+    REQUEST_TIMEOUT = int(os.getenv("AGENT_REQUEST_TIMEOUT", "60"))
 
+    for step in range(max_steps):
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": instance_prompt},
         ]
         if trajectory:
-            # keep context compact; last 20 items is plenty
             messages.append({"role": "user", "content": "\n".join(trajectory[-20:])})
         messages.append({"role": "system", "content": (
             "Generate ONLY this triplet:\n"
@@ -3849,13 +3842,16 @@ def run_llm_loop(
             text = _call_llm(messages)
         except Exception as e:
             logs.append(f"LLM error: {e}")
+            _dbg(f"LLM_LOOP: error {e}")
             break
 
         import re as _re, json as _json
         m = _re.search(r"next_thought:\s*(.*?)\s*next_tool_name:\s*(.*?)\s*next_tool_args:\s*(\{.*\})",
                        text, _re.DOTALL)
         if not m:
-            trajectory.append(f"Parse error: {text[:200]}")
+            msg = f"Parse error: {text[:200]}"
+            trajectory.append(msg)
+            _dbg(f"LLM_LOOP: {msg}")
             continue
 
         thought = m.group(1).strip()
@@ -3876,11 +3872,13 @@ def run_llm_loop(
             f"next_tool_args: {args}",
             f"observation: {obs}",
         ])
-        LOGGER.info("STEP %d | tool=%s | obs=%s", step + 1, tool, str(obs)[:180])
+        _dbg(f"STEP {step+1} | tool={tool} | obs={str(obs)[:180]}")
 
         if tool == "finish" or "TASK_COMPLETE" in str(obs):
+            _dbg("LLM_LOOP: finish signaled")
             break
 
+    _dbg("LLM_LOOP: end")
     return True
 
 
@@ -3892,13 +3890,20 @@ def _fallback_single_pass(
     logs: List[str],
 ) -> Dict[str, Any]:
     """
-    Pragmatic single-run solver:
+    Lightweight solver:
       1) Infer a pytest -k filter (best-effort).
-      2) Run a quick pytest triage to collect failures.
+      2) Run a quick pytest triage (optional).
       3) Optionally run heuristic recipes (Section 13).
-      4) ALWAYS run the LLM loop to read/modify code.
-      5) Stage and return the final patch (recipes + LLM edits).
+      4) ALWAYS run the LLM loop.
+      5) Stage and return the final patch.
     """
+    # Mark that Section 15 path is invoked at all
+    try:
+        open("/tmp/ridges_section15_invoked", "w").write("1")
+    except Exception:
+        pass
+    _dbg("FALLBACK_SINGLE_PASS: start")
+
     # Ensure git operations won’t fail due to safe.directory
     try:
         _ensure_git_safe_directory(repo_dir)  # type: ignore[name-defined]
@@ -3928,7 +3933,6 @@ def _fallback_single_pass(
         failed = triage.get("failed")
         rc = triage.get("returncode")
         logs.append(f"Initial pytest: collected={collected} failed={failed} rc={rc}")
-        # If your Section 6 extracts failing nodeids, wire them here; otherwise leave empty.
         for key in ("failed_tests", "failures", "nodeids"):
             vals = triage.get(key)
             if isinstance(vals, list):
@@ -3936,19 +3940,19 @@ def _fallback_single_pass(
     except Exception as exc:
         logs.append(f"Initial pytest triage skipped (non-fatal): {exc}")
 
-    # 3) Route & apply recipes (non-blocking) — optional
+    # 3) Route & apply recipes (optional, non-blocking)
     USE_RECIPES = os.getenv("AGENT_USE_RECIPES", "1").lower() in {"1", "true", "yes"}
     if USE_RECIPES:
         try:
             logs.append("Running Section 13 recipes (non-blocking)...")
-            changed_any, tried_order = route_and_apply_recipes(  # type: ignore[name-defined]
+            _changed_any, _tried_order = route_and_apply_recipes(  # type: ignore[name-defined]
                 problem_statement=problem_statement,
                 initial_failures=initial_failures,
                 repo_dir=repo_dir,
                 logs=logs,
                 max_attempts=3,
             )
-            logs.append(f"Section 13 tried: {tried_order} (changed_any={changed_any})")
+            logs.append(f"Section 13 tried: {_tried_order}")
         except Exception as exc:
             logs.append(f"Section 13 failed non-fatally: {exc}")
 
@@ -3957,19 +3961,20 @@ def _fallback_single_pass(
         run_llm_loop(problem_statement, initial_failures, repo_dir, logs)
     except Exception as exc:
         logs.append(f"LLM loop failed: {exc}")
+        _dbg(f"LLM_LOOP failed: {exc}")
 
     # 5) Stage and emit the final patch (heuristics + LLM edits)
     try:
-        git_add_all(repo_dir)
+        git_add_all(repo_dir)  # type: ignore[name-defined]
         patch = git_diff_staged(repo_dir)  # type: ignore[name-defined]
     except Exception as exc:
         logs.append(f"Unable to produce patch: {exc}")
         patch = ""
 
-    success = bool(patch.strip())
+    _dbg(f"FALLBACK_SINGLE_PASS: patch_len={len(patch)}")
     return {
-        "success": success,
-        "patch": patch if success else "",
+        "success": bool(patch.strip()),
+        "patch": patch,
         "test_func_names": [],
         "logs": logs[-200:],
     }
@@ -3983,6 +3988,13 @@ def process_task(input_dict: Dict[str, Any], repo_dir: str = "repo") -> Dict[str
       - instance_id (str)
       - run_id (str)
     """
+    # mark Section 15 entry was called
+    try:
+        open("/tmp/ridges_section15_invoked", "w").write("1")
+    except Exception:
+        pass
+    _dbg("PROCESS_TASK: start")
+
     logs: List[str] = []
     try:
         problem_statement = str(input_dict.get("problem_statement", "") or "")
@@ -3991,28 +4003,29 @@ def process_task(input_dict: Dict[str, Any], repo_dir: str = "repo") -> Dict[str
 
         logs.append(f"instance_id={instance_id} run_id={run_id}")
         logs.append(f"repo_dir={repo_dir}")
+        _dbg(f"PROCESS_TASK: instance_id={instance_id} run_id={run_id}")
 
-        # Delegate to the pragmatic single-pass solver
-        logs.append("Running single-pass solver (Section 15).")
+        # Delegate to the pragmatic solver (Section 15)
         result = _fallback_single_pass(problem_statement, instance_id, run_id, repo_dir, logs)
 
         # Ensure JSON-serializable output
         try:
             _ = _safe_json(result)  # type: ignore[name-defined]
         except Exception:
-            # Best effort sanitization
             result = {
                 "success": bool(result.get("success")),
                 "patch": str(result.get("patch", "")),
                 "test_func_names": list(result.get("test_func_names", []) or []),
                 "logs": [str(x) for x in (result.get("logs") or [])][-200:],
             }
+        _dbg("PROCESS_TASK: end")
         return result
 
     except Exception as exc:
         tb = traceback.format_exc()
         logs.append(f"process_task error: {exc}")
         logs.append(tb)
+        _dbg(f"PROCESS_TASK: exception {exc}")
         return {
             "success": False,
             "patch": "",
@@ -4026,30 +4039,6 @@ def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo") -> Dict[str, 
     Ridges / SWE-bench entrypoint. Mirrors process_task.
     """
     return process_task(input_dict, repo_dir=repo_dir)
-
-
-# Optional CLI for local runs
-def run_from_cli(argv: Optional[List[str]] = None) -> int:
-    import argparse
-    parser = argparse.ArgumentParser(description="Ridges-compatible agent runner")
-    parser.add_argument("--problem-statement", required=True)
-    parser.add_argument("--instance-id", default="local__manual")
-    parser.add_argument("--run-id", default=str(int(time.time())))
-    parser.add_argument("--repo-dir", default="repo")
-    args = parser.parse_args(argv)
-
-    payload = {
-        "problem_statement": args.problem_statement,
-        "instance_id": args.instance_id,
-        "run_id": args.run_id,
-    }
-    out = agent_main(payload, repo_dir=args.repo_dir)
-    print(json.dumps(out, indent=2))
-    return 0 if out.get("success") else 1
-
-
-if __name__ == "__main__":
-    sys.exit(run_from_cli())
 
 # =========================
 # Section 16 — Fallbacks & extension hooks
