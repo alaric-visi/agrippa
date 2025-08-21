@@ -3600,7 +3600,7 @@ import time
 
 # Reuse from earlier sections:
 # - LOGGER (Section 2)
-# - run_cmd (Section 2)
+# - run_cmd (Section 3)
 # - run_pytest (Section 6)
 # - git_add_all, git_diff_staged, git_checkout_new_branch_if_needed (Section 3)
 # - heuristic_test_filter_from_problem (Section 16 back-compat shim)
@@ -3609,19 +3609,20 @@ import time
 # - _safe_json (Section 1)
 # - _read_text_safe, _write_text_safe (Section 13)
 
+
 def run_llm_loop(
     problem_statement: str,
-    initial_failures: list,
+    initial_failures: List[str],
     repo_dir: str,
-    logs: list,
+    logs: List[str],
     timeout: Optional[int] = None,
 ) -> bool:
     """
-    Plan–act loop: lets the LLM read the repo, propose edits, syntax-check,
-    and iterate. Always returns True to indicate the loop ran. The caller
-    will collect the patch via git_diff_staged afterwards.
+    Plan–act loop: lets the LLM read the repo, propose edits, run quick tests,
+    syntax-check, and iterate. Always returns True to indicate the loop ran.
+    The caller will collect the final patch via git_diff_staged afterwards.
     """
-    # --- Tool docs shown to the model (concise) ---
+    # --- Tool docs shown to the model (keep concise & actionable) ---
     tool_docs = [
         "list_files(directory: string='.') -> newline-separated .py files",
         "read_file(file_path: string, start_line: int=None, end_line: int=None) -> contents",
@@ -3629,6 +3630,7 @@ def run_llm_loop(
         "edit_file_regex(file_path: string, pattern: string, replacement: string, count: int=1, flags: string='') -> status",
         "edit_file(file_path: string, old_code: string, new_code: string) -> status",
         "insert_code_at_location(file_path: string, line_number: int, code: string, position: string='after') -> status",
+        "run_repo_tests(k_expr: string=None, max_seconds: int=120) -> pytest summary and failing trace",
         "run_syntax_check(file_path: string) -> status",
         "get_changes() -> current staged diff",
         "finish() -> signal done",
@@ -3643,6 +3645,10 @@ def run_llm_loop(
         "next_thought: <what you will do next>\n"
         "next_tool_name: <tool name>\n"
         "next_tool_args: {json-args}\n"
+        "\n"
+        "Tip: Start by calling run_repo_tests (with a narrow k_expr if possible) to see the failing assertion. "
+        "After each edit, rerun run_repo_tests to verify progress. "
+        "If tests still fail after an edit, do not repeat the same change; inspect the traceback and adjust the logic."
     )
 
     instance_prompt = (
@@ -3652,18 +3658,17 @@ def run_llm_loop(
     )
 
     # --- LLM calling helper (uses your proxy defaults) ---
-    import requests
+    import requests  # local import to keep Section 15 self-contained
     AI_PROXY_URL = os.getenv("AI_PROXY_URL", "http://sandbox-proxy").rstrip("/")
     MODEL = os.getenv("AGENT_MODEL", os.getenv("AGENT_MODELS", "zai-org/GLM-4.5-FP8")).split(",")[0].strip()
 
-    def _call_llm(messages: List[Dict[str, str]]) -> str:
+    def _call_llm(messages):
         url_candidates = [f"{AI_PROXY_URL}/agents/inference", f"{AI_PROXY_URL}/chat/completions"]
         last_err = None
         for url in url_candidates:
             try:
                 payload = {"model": MODEL, "messages": messages, "temperature": 0.0, "max_tokens": 2048}
                 LOGGER.info("LLM CALL -> %s (%d messages)", url, len(messages))
-                print(f"[LLM] calling {url} with model={MODEL}")  # breadcrumb
                 r = requests.post(url, json=payload, timeout=60)
                 r.raise_for_status()
                 # Try OpenAI-style JSON first
@@ -3681,10 +3686,9 @@ def run_llm_loop(
             except Exception as e:
                 last_err = e
                 LOGGER.warning("LLM call failed for %s: %s", url, e)
-                print(f"[LLM] call failed for {url}: {e}")  # breadcrumb
         raise RuntimeError(f"LLM calls failed: {last_err}")
 
-    # --- Tool executor (self-contained; uses helpers from Section 13) ---
+    # --- Tool executor (minimal, self-contained) ---
     def _exec_tool(name, args):
         try:
             if name == "list_files":
@@ -3705,21 +3709,34 @@ def run_llm_loop(
                 return txt
             elif name == "search_codebase":
                 term = args.get("search_term") or ""
-                out, _ = run_cmd(["bash", "-lc", f"grep -rn -B 3 -A 3 --include='*.py' . -e \"{term}\" || true"])
+                # Quote safely for grep
+                out, _ = run_cmd([
+                    "bash", "-lc",
+                    f"grep -rn -B 3 -A 3 --include='*.py' . -e {json.dumps(term)} || true"
+                ])
                 return out
             elif name == "edit_file_regex":
                 import re as _re
-                path = args.get("file_path"); pattern = args.get("pattern",""); repl = args.get("replacement","")
-                count = int(args.get("count", 1)); flags = args.get("flags","")
-                re_flags = 0
-                if "I" in flags: re_flags |= _re.IGNORECASE
-                if "M" in flags: re_flags |= _re.MULTILINE
-                if "S" in flags: re_flags |= _re.DOTALL
+                path = args.get("file_path")
+                pattern = args.get("pattern", "")
+                repl = args.get("replacement", "")
+                count = int(args.get("count", 1))
+                flags = args.get("flags", "")
+                if not path:
+                    return "file_path required"
                 txt = _read_text_safe(path)
+                re_flags = 0
+                if "I" in flags:
+                    re_flags |= _re.IGNORECASE
+                if "M" in flags:
+                    re_flags |= _re.MULTILINE
+                if "S" in flags:
+                    re_flags |= _re.DOTALL
                 new_txt, n = _re.subn(pattern, repl, txt, count=0 if count == -1 else count, flags=re_flags)
                 if n > 0 and new_txt != txt:
                     _write_text_safe(path, new_txt)
                     obs = f"Regex edit applied: {n} replacements"
+                    # auto syntax check
                     if path.endswith(".py"):
                         try:
                             compile(new_txt, path, "exec")
@@ -3729,7 +3746,11 @@ def run_llm_loop(
                     return obs
                 return "No matches"
             elif name == "edit_file":
-                path = args.get("file_path"); old = args.get("old_code",""); new = args.get("new_code","")
+                path = args.get("file_path")
+                old = args.get("old_code", "")
+                new = args.get("new_code", "")
+                if not path:
+                    return "file_path required"
                 txt = _read_text_safe(path)
                 if old not in txt:
                     return "old_code not found"
@@ -3743,11 +3764,15 @@ def run_llm_loop(
                         return f"edited + syntax error: {e}"
                 return "edited"
             elif name == "insert_code_at_location":
-                path = args.get("file_path"); line = int(args.get("line_number", 1))
-                code = args.get("code",""); pos = args.get("position","after")
+                path = args.get("file_path")
+                line = int(args.get("line_number", 1))
+                code = args.get("code", "")
+                pos = args.get("position", "after")
+                if not path:
+                    return "file_path required"
                 lines = _read_text_safe(path).splitlines(True)
-                idx = max(0, min(len(lines), line-1 if pos=="before" else line))
-                lines.insert(idx, code if code.endswith("\n") else code+"\n")
+                idx = max(0, min(len(lines), line - 1 if pos == "before" else line))
+                lines.insert(idx, code if code.endswith("\n") else code + "\n")
                 new_txt = "".join(lines)
                 _write_text_safe(path, new_txt)
                 if path.endswith(".py"):
@@ -3757,11 +3782,29 @@ def run_llm_loop(
                     except Exception as e:
                         return f"inserted + syntax error: {e}"
                 return "inserted"
+            elif name == "run_repo_tests":
+                k_expr = args.get("k_expr")
+                max_seconds = int(args.get("max_seconds", 120))
+                try:
+                    triage = run_pytest(repo_dir, k_expr=k_expr, path=None, max_seconds=max_seconds)
+                    summary = {
+                        "collected": triage.get("collected"),
+                        "failed": triage.get("failed"),
+                        "returncode": triage.get("returncode"),
+                        "nodeids": triage.get("nodeids") or triage.get("failed_tests") or triage.get("failures"),
+                        "output_tail": (triage.get("output_tail") or triage.get("stderr_tail") or triage.get("stdout_tail") or "")[-4000:],
+                    }
+                    return json.dumps(summary, ensure_ascii=False)
+                except Exception as e:
+                    return f"run_repo_tests error: {e}"
             elif name == "run_syntax_check":
                 path = args.get("file_path")
+                if not path:
+                    return "file_path required"
                 src = _read_text_safe(path)
                 try:
-                    compile(src, path, "exec"); return "syntax OK"
+                    compile(src, path, "exec")
+                    return "syntax OK"
                 except Exception as e:
                     return f"syntax error: {e}"
             elif name == "get_changes":
@@ -3776,14 +3819,23 @@ def run_llm_loop(
 
     # --- main loop ---
     trajectory: List[str] = []
-    max_steps = int(os.getenv("AGENT_MAX_STEPS", "60"))
-    print(f"[LLM] loop starting; max_steps={max_steps}")  # breadcrumb
+    max_steps = int(os.getenv("AGENT_MAX_STEPS", "40"))
+    start_time = time.time()
+    req_timeout = int(os.getenv("AGENT_REQUEST_TIMEOUT", "60"))
     for step in range(max_steps):
+        # soft time budget so we don't collide with the overall harness timeout
+        elapsed = time.time() - start_time
+        overall_timeout = timeout or int(os.getenv("AGENT_TIMEOUT", "1200"))
+        if overall_timeout - elapsed < (req_timeout + 10):
+            logs.append(f"LLM loop stopping early for time safety (step={step+1})")
+            break
+
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": instance_prompt},
         ]
         if trajectory:
+            # keep context compact; last 20 items is plenty
             messages.append({"role": "user", "content": "\n".join(trajectory[-20:])})
         messages.append({"role": "system", "content": (
             "Generate ONLY this triplet:\n"
@@ -3797,7 +3849,6 @@ def run_llm_loop(
             text = _call_llm(messages)
         except Exception as e:
             logs.append(f"LLM error: {e}")
-            print(f"[LLM] fatal error: {e}")  # breadcrumb
             break
 
         import re as _re, json as _json
@@ -3805,7 +3856,6 @@ def run_llm_loop(
                        text, _re.DOTALL)
         if not m:
             trajectory.append(f"Parse error: {text[:200]}")
-            print(f"[LLM] parse error, got: {text[:120]}")  # breadcrumb
             continue
 
         thought = m.group(1).strip()
@@ -3826,8 +3876,7 @@ def run_llm_loop(
             f"next_tool_args: {args}",
             f"observation: {obs}",
         ])
-        LOGGER.info("STEP %d | tool=%s | obs=%s", step+1, tool, str(obs)[:180])
-        print(f"[LLM] step={step+1} tool={tool} obs={str(obs)[:100]}")  # breadcrumb
+        LOGGER.info("STEP %d | tool=%s | obs=%s", step + 1, tool, str(obs)[:180])
 
         if tool == "finish" or "TASK_COMPLETE" in str(obs):
             break
@@ -3843,11 +3892,12 @@ def _fallback_single_pass(
     logs: List[str],
 ) -> Dict[str, Any]:
     """
-    Pragmatic solver:
-      1) Optional pytest triage to capture initial failures.
-      2) Conditionally run Section 13 heuristic recipes (if AGENT_USE_RECIPES truthy).
-      3) Always run the LLM plan–act loop.
-      4) Stage and return the final patch (whatever changed).
+    Pragmatic single-run solver:
+      1) Infer a pytest -k filter (best-effort).
+      2) Run a quick pytest triage to collect failures.
+      3) Optionally run heuristic recipes (Section 13).
+      4) ALWAYS run the LLM loop to read/modify code.
+      5) Stage and return the final patch (recipes + LLM edits).
     """
     # Ensure git operations won’t fail due to safe.directory
     try:
@@ -3863,18 +3913,12 @@ def _fallback_single_pass(
     except Exception as exc:
         logs.append(f"Branch creation error (non-fatal): {exc}")
 
-    logs.append(f"ENV AGENT_USE_RECIPES={os.getenv('AGENT_USE_RECIPES')}")
-    print(f"[ENTRY] AGENT_USE_RECIPES={os.getenv('AGENT_USE_RECIPES')}")  # breadcrumb
-
     # 1) Derive a -k expression for pytest
     try:
         k_expr: Optional[str] = heuristic_test_filter_from_problem(problem_statement)  # type: ignore[name-defined]
     except Exception:
         k_expr = None
-    if k_expr:
-        logs.append(f"pytest -k filter inferred: {k_expr}")
-    else:
-        logs.append("pytest -k filter inferred: <none>")
+    logs.append(f"pytest -k filter inferred: {k_expr or '<none>'}")
 
     # 2) Quick triage (ignore failures; just log what we can)
     initial_failures: List[str] = []
@@ -3884,6 +3928,7 @@ def _fallback_single_pass(
         failed = triage.get("failed")
         rc = triage.get("returncode")
         logs.append(f"Initial pytest: collected={collected} failed={failed} rc={rc}")
+        # If your Section 6 extracts failing nodeids, wire them here; otherwise leave empty.
         for key in ("failed_tests", "failures", "nodeids"):
             vals = triage.get(key)
             if isinstance(vals, list):
@@ -3891,47 +3936,40 @@ def _fallback_single_pass(
     except Exception as exc:
         logs.append(f"Initial pytest triage skipped (non-fatal): {exc}")
 
-    # 3) Route & apply recipes (Section 13) — ONLY if enabled
-    use_recipes = os.getenv("AGENT_USE_RECIPES", "1").lower() in {"1", "true", "yes"}
-    if use_recipes:
+    # 3) Route & apply recipes (non-blocking) — optional
+    USE_RECIPES = os.getenv("AGENT_USE_RECIPES", "1").lower() in {"1", "true", "yes"}
+    if USE_RECIPES:
         try:
             logs.append("Running Section 13 recipes (non-blocking)...")
-            print("[RECIPES] running Section 13")  # breadcrumb
-            _changed_any, _tried_order = route_and_apply_recipes(  # type: ignore[name-defined]
+            changed_any, tried_order = route_and_apply_recipes(  # type: ignore[name-defined]
                 problem_statement=problem_statement,
                 initial_failures=initial_failures,
                 repo_dir=repo_dir,
                 logs=logs,
                 max_attempts=3,
             )
-            logs.append(f"Section 13 tried: {_tried_order}")
+            logs.append(f"Section 13 tried: {tried_order} (changed_any={changed_any})")
         except Exception as exc:
             logs.append(f"Section 13 failed non-fatally: {exc}")
-            print(f"[RECIPES] failed: {exc}")  # breadcrumb
-    else:
-        logs.append("Section 13 recipes disabled via AGENT_USE_RECIPES.")
-        print("[RECIPES] disabled")  # breadcrumb
 
-    # 4) ALWAYS run the LLM loop
+    # 4) ALWAYS run the LLM loop to actually solve the issue
     try:
-        print("[LLM] starting plan–act loop")  # breadcrumb
         run_llm_loop(problem_statement, initial_failures, repo_dir, logs)
     except Exception as exc:
         logs.append(f"LLM loop failed: {exc}")
-        print(f"[LLM] loop failed: {exc}")  # breadcrumb
 
-    # Stage and emit the final patch (heuristics + LLM edits)
+    # 5) Stage and emit the final patch (heuristics + LLM edits)
     try:
         git_add_all(repo_dir)
-        patch = git_diff_staged(repo_dir)
+        patch = git_diff_staged(repo_dir)  # type: ignore[name-defined]
     except Exception as exc:
         logs.append(f"Unable to produce patch: {exc}")
-        print(f"[PATCH] failed: {exc}")  # breadcrumb
         patch = ""
 
+    success = bool(patch.strip())
     return {
-        "success": bool(patch.strip()),
-        "patch": patch,
+        "success": success,
+        "patch": patch if success else "",
         "test_func_names": [],
         "logs": logs[-200:],
     }
@@ -3954,6 +3992,7 @@ def process_task(input_dict: Dict[str, Any], repo_dir: str = "repo") -> Dict[str
         logs.append(f"instance_id={instance_id} run_id={run_id}")
         logs.append(f"repo_dir={repo_dir}")
 
+        # Delegate to the pragmatic single-pass solver
         logs.append("Running single-pass solver (Section 15).")
         result = _fallback_single_pass(problem_statement, instance_id, run_id, repo_dir, logs)
 
@@ -3961,6 +4000,7 @@ def process_task(input_dict: Dict[str, Any], repo_dir: str = "repo") -> Dict[str
         try:
             _ = _safe_json(result)  # type: ignore[name-defined]
         except Exception:
+            # Best effort sanitization
             result = {
                 "success": bool(result.get("success")),
                 "patch": str(result.get("patch", "")),
